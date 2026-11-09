@@ -107,96 +107,137 @@ Folder mandiri `iaet-ml-api` sudah disiapkan di direktori workspace:
 
 ```text
 iaet-ml-api/
+├── .dockerignore
 ├── .gitignore
+├── .python-version
+├── Dockerfile
+├── Procfile
 ├── README.md
 ├── app.py
+├── ml-deploy-plan.md
+├── model_iaet_xgboost.joblib
+├── render.yaml
 ├── requirements.txt
-└── model_iaet_xgboost.joblib
+└── test_api.py
 ```
 
 > **Keuntungan:**
 >
 > 1. Sangat ringan dan 100% terisolasi dari branch frontend/backend teman (`ekaa`).
-> 2. Deploy ke Render tinggal 1-klik hubungkan repo `iaet-ml-api` tanpa ribet setting root directory.
+> 2. Deploy ke Render tinggal 1-klik hubungkan repo `iaet-ml` tanpa ribet setting root directory.
 > 3. File binary `.joblib` tidak mengotori riwayat git web utama.
 
-`requirements.txt` (isi versi dari Tahap 1):
+`requirements.txt` (versi terkunci sesuai environment pengujian):
 
 ```text
-fastapi
-uvicorn
-pandas==<versi>
-numpy==<versi>
-joblib==<versi>
-scikit-learn==<versi>
-xgboost==<versi>
+fastapi==0.162.2
+uvicorn[standard]==0.54.0
+pydantic==2.14.3
+pandas==2.3.3
+numpy==1.26.4
+joblib==1.6.0
+scikit-learn==1.6.1
+xgboost==3.2.0
 ```
 
 `app.py`:
 
 ```python
+from pathlib import Path
 import joblib
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-bundle = joblib.load("model_iaet_xgboost.joblib")
-model = bundle["model"]
-le = bundle["label_encoder"]
-LEVEL_COLS = bundle.get("fitur", ["reading_level", "SWE_level", "listening_level"])
+app = FastAPI(
+    title="IAET-SIM ML Classification API",
+    description="API untuk memprediksi level kemahiran bahasa Inggris (Beginner, Intermediate, Advanced) menggunakan XGBoost.",
+    version="1.0.0"
+)
 
-# Aturan dari dataset: 50 soal x 4,51 poin = 225,5 poin per subbab.
-# Beginner      : 0 - 67,65      (0-15 benar)
-# Intermediate  : 72,16 - 180,4  (16-40 benar)
-# Advanced      : 184,91 - 225,5 (41-50 benar)
-# Batas di bawah adalah titik tengah di antara dua rentang yang bersebelahan.
-BATAS_BEGINNER_MAKS = 69.9
-BATAS_INTERMEDIATE_MAKS = 182.65
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+MODEL_PATH = Path(__file__).resolve().parent / "model_iaet_xgboost.joblib"
+
+try:
+    bundle = joblib.load(MODEL_PATH)
+    model = bundle["model"]
+    le = bundle["label_encoder"]
+    LEVEL_COLS = bundle.get("fitur", ["reading_level", "SWE_level", "listening_level"])
+except Exception as e:
+    bundle = None
+    model = None
+    le = None
+    LEVEL_COLS = ["reading_level", "SWE_level", "listening_level"]
+    print(f"Warning: Gagal memuat model (.joblib): {e}")
+
+BATAS_BEGINNER_MAKS = 69.905
+BATAS_INTERMEDIATE_MAKS = 182.655
 POIN_MAKS = 225.5
 
 def skor_ke_level(persen: float) -> str:
-    poin = persen / 100.0 * POIN_MAKS
+    poin = (persen / 100.0) * POIN_MAKS
     if poin <= BATAS_BEGINNER_MAKS:
         return "Beginner"
-    if poin <= BATAS_INTERMEDIATE_MAKS:
+    elif poin <= BATAS_INTERMEDIATE_MAKS:
         return "Intermediate"
-    return "Advanced"
-
-app = FastAPI(title="IAET Level Classifier API")
+    else:
+        return "Advanced"
 
 class ScorePayload(BaseModel):
-    listening_score: float = Field(..., ge=0, le=100)
-    structure_score: float = Field(..., ge=0, le=100)
-    reading_score: float = Field(..., ge=0, le=100)
-    overall_score: float | None = None  # dikirim backend, tidak dipakai
+    listening_score: float = Field(..., ge=0, le=100, description="Skor listening dalam persen (0-100)")
+    structure_score: float = Field(..., ge=0, le=100, description="Skor structure/SWE dalam persen (0-100)")
+    reading_score: float = Field(..., ge=0, le=100, description="Skor reading dalam persen (0-100)")
+    overall_score: float | None = Field(default=None, description="Skor total (opsional)")
 
 @app.get("/")
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health_check():
+    return {
+        "status": "healthy",
+        "service": "IAET-SIM ML API",
+        "model_loaded": model is not None
+    }
 
 @app.post("/predict")
-def predict(d: ScorePayload):
-    reading = skor_ke_level(d.reading_score)
-    swe = skor_ke_level(d.structure_score)
-    listening = skor_ke_level(d.listening_score)
+def predict_grade(payload: ScorePayload):
+    if model is None or le is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Model ML belum dimuat dengan benar di server."
+        )
 
-    X = pd.DataFrame([{
-        "reading_level": reading,
-        "SWE_level": swe,
-        "listening_level": listening,
-    }])[LEVEL_COLS]
+    sub_levels = {
+        "listening_level": skor_ke_level(payload.listening_score),
+        "SWE_level": skor_ke_level(payload.structure_score),
+        "reading_level": skor_ke_level(payload.reading_score),
+    }
 
-    pred = model.predict(X).astype(int)
-    overall = le.inverse_transform(pred)[0]
+    df_input = pd.DataFrame([sub_levels])
+    pred_code = model.predict(df_input[LEVEL_COLS])
+    pred_label = le.inverse_transform(pred_code.astype(int))[0]
+    grade_normalized = str(pred_label).strip().lower()
 
     return {
-        "grade": overall.lower(),
+        "grade": grade_normalized,
+        "prediction": grade_normalized,
         "sub_levels": {
-            "reading_level": reading,
-            "SWE_level": swe,
-            "listening_level": listening,
+            "listening": sub_levels["listening_level"],
+            "structure": sub_levels["SWE_level"],
+            "reading": sub_levels["reading_level"],
         },
+        "input_scores": {
+            "listening": payload.listening_score,
+            "structure": payload.structure_score,
+            "reading": payload.reading_score,
+        }
     }
 ```
 
